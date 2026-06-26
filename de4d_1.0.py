@@ -3,23 +3,29 @@ import cv2
 import time
 import sys
 from PIL import Image
-from multiprocessing import Process
 import os
+import platform
+import queue
+import threading
 os.environ['PYGAME_HIDE_SUPPORT_PROMPT'] = "hide"
 import pygame
 import fpstimer
 import moviepy.editor as mp
 
 
-ASCII_CHARS = ["@", "#", "S", "%", "?", "*", "+", ";", ":", ",", " "]
-# Get terminal dimensions for dynamic frame sizing
+# A sharper, high-contrast character set that emphasizes edges and line structure.
+ASCII_CHARS = "@%#*+=-:. "
+# Get terminal dimensions for dynamic frame sizing.
+# The ASCII art will scale with the terminal width while preserving its aspect ratio.
 terminal_size = os.get_terminal_size()
 frame_size = terminal_size.columns
 terminal_height = terminal_size.lines
 # Default frame rate (will be overridden by actual video FPS)
 frame_rate = 30.0
 
-ASCII_LIST = []
+# Queue used by producer thread to hand pre-rendered frames to the playback thread.
+frame_queue = queue.Queue(maxsize=16)
+stop_event = threading.Event()
 
 
 def play_audio(path):
@@ -47,57 +53,87 @@ def stop_audio():
         pass
 
 
-def play_video(total_frames, fps=30.0):
-    """Display ASCII frames in terminal with audio synchronization."""
+def play_video(fps=30.0):
+    """Display ASCII frames from the producer queue with audio synchronization."""
     try:
-        # Refresh terminal size in case it changed
         current_terminal = os.get_terminal_size()
         cols = current_terminal.columns
         rows = current_terminal.lines
         os.system(f'mode {cols}, {rows}')
 
-        # Create timer based on actual video frame rate
         timer = fpstimer.FPSTimer(fps)
-        start_frame = 0
+        last_cols, last_rows = cols, rows
 
-        for frame_number in range(start_frame, total_frames):
-            sys.stdout.write("\r" + ASCII_LIST[frame_number])
-            timer.sleep()
+        # Use alternate buffer so the terminal does not keep scrolling old output upward.
+        sys.stdout.write("\033[?1049h")
+        sys.stdout.flush()
+
+        try:
+            while True:
+                ascii_frame = frame_queue.get()
+                if ascii_frame is None:
+                    break
+
+                current_terminal = os.get_terminal_size()
+                cols, rows = current_terminal.columns, current_terminal.lines
+                if (cols, rows) != (last_cols, last_rows):
+                    os.system(f'mode {cols}, {rows}')
+                    last_cols, last_rows = cols, rows
+
+                sys.stdout.write("\033[H" + ascii_frame)
+                sys.stdout.flush()
+                timer.sleep()
+        finally:
+            sys.stdout.write("\033[?1049l")
+            sys.stdout.flush()
     except KeyboardInterrupt:
+        stop_event.set()
         sys.stdout.write('\nPlayback stopped by user.\n')
         stop_audio()
+        try:
+            frame_queue.put_nowait(None)
+        except queue.Full:
+            pass
 
 
 # Extract frames from video and convert to ASCII art
+# This function runs in a producer thread.
 def extract_transform_generate(video_path, start_frame, number_of_frames=1000):
-    """Read video frames and convert them to ASCII art for display."""
+    """Read video frames and queue ASCII frames for playback."""
     capture = cv2.VideoCapture(video_path)
     capture.set(1, start_frame)  # Jump to starting frame
     current_frame = start_frame
     frame_count = 1
     ret, image_frame = capture.read()
-    while ret and frame_count <= number_of_frames:
+    while ret and frame_count <= number_of_frames and not stop_event.is_set():
         ret, image_frame = capture.read()
         try:
             image = Image.fromarray(image_frame)
-            # Convert frame to ASCII characters
             ascii_characters = pixels_to_ascii(greyscale(resize_image(image)))
             pixel_count = len(ascii_characters)
-            # Arrange ASCII characters into lines based on frame width
             ascii_image = "\n".join(
                 [ascii_characters[index:(index + frame_size)] for index in range(0, pixel_count, frame_size)])
-
-            ASCII_LIST.append(ascii_image)
-
-        except Exception as error:
-            continue
+            while not stop_event.is_set():
+                try:
+                    frame_queue.put(ascii_image, timeout=0.1)
+                    break
+                except queue.Full:
+                    continue
+        except Exception:
+            pass
 
         progress_bar(frame_count, number_of_frames)
-
         frame_count += 1
         current_frame += 1
 
     capture.release()
+    while True:
+        try:
+            frame_queue.put(None, timeout=0.1)
+            break
+        except queue.Full:
+            if stop_event.is_set():
+                break
 
 
 # Display processing progress with a visual bar
@@ -130,7 +166,8 @@ def greyscale(image_frame):
 def pixels_to_ascii(image_frame):
     """Convert pixel brightness values to ASCII characters."""
     pixels = image_frame.getdata()
-    characters = "".join([ASCII_CHARS[pixel // 25] for pixel in pixels])
+    max_index = len(ASCII_CHARS) - 1
+    characters = "".join([ASCII_CHARS[int(pixel / 255 * max_index)] for pixel in pixels])
     return characters
 
 
@@ -170,12 +207,6 @@ def preflight_operations(path):
         path_to_audio = 'audio.mp3'
         video.audio.write_audiofile(path_to_audio)
 
-        start_time = time.time()
-        sys.stdout.write('Beginning ASCII generation...\n')
-        extract_transform_generate(path_to_video, 1, total_frames)
-        execution_time = time.time() - start_time
-        sys.stdout.write('ASCII generation completed! ASCII generation time: ' + str(execution_time) + '\n')
-
         return total_frames, video_fps
 
     else:
@@ -190,13 +221,26 @@ def main():
     args = parser.parse_args()
 
     if args.video_file:
+        stop_event.clear()
         total_frames, video_fps = preflight_operations(args.video_file)
         if total_frames:
+            producer = threading.Thread(
+                target=extract_transform_generate,
+                args=(args.video_file, 1, total_frames),
+                daemon=True,
+            )
+            producer.start()
             try:
                 play_audio('audio.mp3')
-                play_video(total_frames=total_frames, fps=video_fps)
+                play_video(fps=video_fps)
             except KeyboardInterrupt:
+                stop_event.set()
                 stop_audio()
+                try:
+                    frame_queue.put_nowait(None)
+                except queue.Full:
+                    pass
+            producer.join()
         return
 
     while True:
@@ -211,14 +255,27 @@ def main():
         user_input.strip()
 
         if user_input == '1':
+            stop_event.clear()
             user_input = str(input("Please enter the video file name (file must be in root!): "))
             total_frames, video_fps = preflight_operations(user_input)
             if total_frames:
+                producer = threading.Thread(
+                    target=extract_transform_generate,
+                    args=(user_input, 1, total_frames),
+                    daemon=True,
+                )
+                producer.start()
                 try:
                     play_audio('audio.mp3')
-                    play_video(total_frames=total_frames, fps=video_fps)
+                    play_video(fps=video_fps)
                 except KeyboardInterrupt:
+                    stop_event.set()
                     stop_audio()
+                    try:
+                        frame_queue.put_nowait(None)
+                    except queue.Full:
+                        pass
+                producer.join()
         elif user_input == '2':
             exit()
             continue
