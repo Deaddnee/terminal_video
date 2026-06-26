@@ -3,10 +3,8 @@ import cv2
 import time
 import sys
 from PIL import Image
+from multiprocessing import Process
 import os
-import platform
-import queue
-import threading
 import tempfile
 os.environ['PYGAME_HIDE_SUPPORT_PROMPT'] = "hide"
 import pygame
@@ -14,23 +12,15 @@ import fpstimer
 import moviepy.editor as mp
 
 
-# A sharper, high-contrast character set that emphasizes edges and line structure.
-ASCII_CHARS = "@%#*+=-:. "
-# Get terminal dimensions for dynamic frame sizing.
-# The ASCII art will scale with the terminal width while preserving its aspect ratio.
-terminal_size = os.get_terminal_size()
-frame_size = terminal_size.columns
-terminal_height = terminal_size.lines
-# Default frame rate (will be overridden by actual video FPS)
-frame_rate = 30.0
+ASCII_CHARS = ["@", "#", "S", "%", "?", "*", "+", ";", ":", ",", " "]
+frame_size = 150
+frame_interval = 1.0 / 30.75
+benchmark_frame_count = 100
 
-# Queue used by producer thread to hand pre-rendered frames to the playback thread.
-frame_queue = queue.Queue(maxsize=16)
-stop_event = threading.Event()
+ASCII_LIST = []
 
 
 def play_audio(path):
-    """Initialize pygame mixer and play audio file."""
     pygame.init()
     pygame.mixer.pre_init(44100, -16, 2, 2048)
     pygame.mixer.init()
@@ -38,119 +28,57 @@ def play_audio(path):
     pygame.mixer.music.play()
 
 
-def stop_audio():
-    """Stop any playing audio and quit pygame cleanly."""
-    try:
-        pygame.mixer.music.stop()
-    except Exception:
-        pass
-    try:
-        pygame.mixer.quit()
-    except Exception:
-        pass
-    try:
-        pygame.quit()
-    except Exception:
-        pass
+def play_video(total_frames):
+    os.system('mode 150, 500')
+
+    timer = fpstimer.FPSTimer(30)
+    start_frame = 0
+
+    for frame_number in range(start_frame, total_frames):
+        sys.stdout.write("\r" + ASCII_LIST[frame_number])
+        timer.sleep()
 
 
-def play_video(fps=30.0):
-    """Display ASCII frames from the producer queue with audio synchronization."""
-    try:
-        current_terminal = os.get_terminal_size()
-        cols = current_terminal.columns
-        rows = current_terminal.lines
-        os.system(f'mode {cols}, {rows}')
-
-        timer = fpstimer.FPSTimer(fps)
-        last_cols, last_rows = cols, rows
-
-        # Use alternate buffer so the terminal does not keep scrolling old output upward.
-        sys.stdout.write("\033[?1049h")
-        sys.stdout.flush()
-
-        try:
-            while True:
-                ascii_frame = frame_queue.get()
-                if ascii_frame is None:
-                    break
-
-                current_terminal = os.get_terminal_size()
-                cols, rows = current_terminal.columns, current_terminal.lines
-                if (cols, rows) != (last_cols, last_rows):
-                    os.system(f'mode {cols}, {rows}')
-                    last_cols, last_rows = cols, rows
-
-                sys.stdout.write("\033[H" + ascii_frame)
-                sys.stdout.flush()
-                timer.sleep()
-        finally:
-            sys.stdout.write("\033[?1049l")
-            sys.stdout.flush()
-    except KeyboardInterrupt:
-        stop_event.set()
-        sys.stdout.write('\nPlayback stopped by user.\n')
-        stop_audio()
-        try:
-            frame_queue.put_nowait(None)
-        except queue.Full:
-            pass
-
-
-# Extract frames from video and convert to ASCII art
-# This function runs in a producer thread.
 def extract_transform_generate(video_path, start_frame, number_of_frames=1000):
-    """Read video frames and queue ASCII frames for playback."""
     capture = cv2.VideoCapture(video_path)
-    capture.set(1, start_frame)  # Jump to starting frame
+    capture.set(1, start_frame)  # Points cap to target frame
     current_frame = start_frame
     frame_count = 1
     ret, image_frame = capture.read()
-    while ret and frame_count <= number_of_frames and not stop_event.is_set():
+    while ret and frame_count <= number_of_frames:
         ret, image_frame = capture.read()
         try:
             image = Image.fromarray(image_frame)
-            ascii_characters = pixels_to_ascii(greyscale(resize_image(image)))
+            ascii_characters = pixels_to_ascii(greyscale(resize_image(image)))  # get ascii characters
             pixel_count = len(ascii_characters)
             ascii_image = "\n".join(
                 [ascii_characters[index:(index + frame_size)] for index in range(0, pixel_count, frame_size)])
-            while not stop_event.is_set():
-                try:
-                    frame_queue.put(ascii_image, timeout=0.1)
-                    break
-                except queue.Full:
-                    continue
+
+            ASCII_LIST.append(ascii_image)
+
         except Exception:
-            pass
+            continue
 
         progress_bar(frame_count, number_of_frames)
         frame_count += 1
         current_frame += 1
 
     capture.release()
-    while True:
-        try:
-            frame_queue.put(None, timeout=0.1)
-            break
-        except queue.Full:
-            if stop_event.is_set():
-                break
 
 
-def benchmark_video(video_path, number_of_frames=100):
-    """Process a fixed number of frames and report throughput."""
+def benchmark_video(video_path, number_of_frames=benchmark_frame_count):
     capture = cv2.VideoCapture(video_path)
     total_frames = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
     video_width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
     video_height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
     frames_to_process = min(number_of_frames, total_frames)
     processed = 0
+    total_chars = 0
 
     sys.stdout.write(f"Benchmarking {frames_to_process} frames from {video_path}\n")
     sys.stdout.write(f"Video resolution: {video_width}x{video_height}, total frames: {total_frames}\n")
 
     start_time = time.perf_counter()
-    total_chars = 0
     while processed < frames_to_process:
         ret, image_frame = capture.read()
         if not ret:
@@ -164,6 +92,7 @@ def benchmark_video(video_path, number_of_frames=100):
                 [ascii_characters[index:(index + frame_size)] for index in range(0, pixel_count, frame_size)])
         except Exception:
             pass
+
         processed += 1
         progress_bar(processed, frames_to_process)
 
@@ -180,52 +109,44 @@ def benchmark_video(video_path, number_of_frames=100):
     )
 
 
-# Display processing progress with a visual bar
+# Progress bar code is courtesy of StackOverflow user: Aravind Voggu.
+# Link to thread: https://stackoverflow.com/questions/6169217/replace-console-output-in-python
 def progress_bar(current, total, barLength=25):
-    """Show progress bar for frame processing."""
     progress = float(current) * 100 / total
     arrow = '#' * int(progress / 100 * barLength - 1)
     spaces = ' ' * (barLength - len(arrow))
     sys.stdout.write('\rProgress: [%s%s] %d%% Frame %d of %d frames' % (arrow, spaces, progress, current, total))
 
 
-# Resize image to fit terminal width
+# Resize image
 def resize_image(image_frame):
-    """Resize image to match terminal width while maintaining aspect ratio."""
     width, height = image_frame.size
-    # Adjust for console character aspect ratio (characters are taller than wide)
-    aspect_ratio = (height / float(width * 2.5))
+    aspect_ratio = (height / float(width * 2.5))  # 2.5 modifier to offset vertical scaling on console
     new_height = int(aspect_ratio * frame_size)
     resized_image = image_frame.resize((frame_size, new_height))
     return resized_image
 
 
-# Convert image to greyscale
+# Greyscale
 def greyscale(image_frame):
-    """Convert color image to greyscale for ASCII conversion."""
     return image_frame.convert("L")
 
 
-# Map pixel brightness values to ASCII characters
+# Convert pixels to ascii
 def pixels_to_ascii(image_frame):
-    """Convert pixel brightness values to ASCII characters."""
     pixels = image_frame.getdata()
-    max_index = len(ASCII_CHARS) - 1
-    characters = "".join([ASCII_CHARS[int(pixel / 255 * max_index)] for pixel in pixels])
+    characters = "".join([ASCII_CHARS[pixel // 25] for pixel in pixels])
     return characters
 
 
-# Process images: Resize => Greyscale => Convert to ASCII => Save to file
+# Open image => Resize => Greyscale => Convert to ASCII => Store in text file
 def ascii_generator(image_path, start_frame, number_of_frames):
-    """Convert static images to ASCII art and save to text files."""
     current_frame = start_frame
     while current_frame <= number_of_frames:
         path_to_image = image_path + '/BadApple_' + str(current_frame) + '.jpg'
         image = Image.open(path_to_image)
-        # Convert image through pipeline: resize -> greyscale -> ASCII
-        ascii_characters = pixels_to_ascii(greyscale(resize_image(image)))
+        ascii_characters = pixels_to_ascii(greyscale(resize_image(image)))  # get ascii characters
         pixel_count = len(ascii_characters)
-        # Arrange ASCII into lines matching terminal width
         ascii_image = "\n".join(
             [ascii_characters[index:(index + frame_size)] for index in range(0, pixel_count, frame_size)])
         file_name = r"TextFiles/" + "bad_apple" + str(current_frame) + ".txt"
@@ -238,13 +159,10 @@ def ascii_generator(image_path, start_frame, number_of_frames):
 
 
 def preflight_operations(path, extract_audio=True):
-    """Extract video info, optionally audio, and prepare for playback."""
     if os.path.exists(path):
         path_to_video = path.strip()
         cap = cv2.VideoCapture(path_to_video)
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        # Get the actual FPS from the video file
-        video_fps = cap.get(cv2.CAP_PROP_FPS)
         cap.release()
 
         audio_path = None
@@ -259,94 +177,64 @@ def preflight_operations(path, extract_audio=True):
         else:
             sys.stdout.write('Benchmark mode: skipping audio extraction. Source audio is preserved.\n')
 
-        return total_frames, video_fps, audio_path
+        return total_frames, audio_path
 
     else:
         sys.stdout.write('Warning file not found!\n')
-        return 0, 30.0, None
+        return 0
 
 
 def main():
-    """Main menu for user interaction and optional command-line playback."""
-    parser = argparse.ArgumentParser(description='Play Bad Apple as ASCII art in the terminal.')
+    parser = argparse.ArgumentParser(description='Play Bad Apple v4.5 as ASCII art in the terminal.')
     parser.add_argument('video_file', nargs='?', help='Optional video file to play directly')
     parser.add_argument('-b', '--benchmark', action='store_true', help='Benchmark frame processing instead of playing back.')
     args = parser.parse_args()
 
     if args.video_file:
-        stop_event.clear()
-        total_frames, video_fps, audio_path = preflight_operations(args.video_file, extract_audio=not args.benchmark)
+        total_frames, audio_path = preflight_operations(args.video_file, extract_audio=not args.benchmark)
         if total_frames:
             if args.benchmark:
                 benchmark_video(args.video_file)
                 return
 
-            producer = threading.Thread(
-                target=extract_transform_generate,
-                args=(args.video_file, 1, total_frames),
-                daemon=True,
-            )
-            producer.start()
             try:
                 if audio_path:
                     play_audio(audio_path)
-                play_video(fps=video_fps)
-            except KeyboardInterrupt:
-                stop_event.set()
-                stop_audio()
-                try:
-                    frame_queue.put_nowait(None)
-                except queue.Full:
-                    pass
+                extract_transform_generate(args.video_file, 1, total_frames)
+                play_video(total_frames=total_frames)
             finally:
                 if audio_path and os.path.exists(audio_path):
                     try:
                         os.remove(audio_path)
                     except OSError:
                         pass
-            producer.join()
         return
 
     while True:
         sys.stdout.write('==============================================================\n')
-        sys.stdout.write('Bad Apple ASCII Player\n')
-        sys.stdout.write('==============================================================\n')
+        sys.stdout.write('Select option: \n')
         sys.stdout.write('1) Play\n')
         sys.stdout.write('2) Exit\n')
         sys.stdout.write('==============================================================\n')
 
         user_input = str(input("Your option: "))
-        user_input.strip()
+        user_input.strip()  # removes trailing whitespaces
 
         if user_input == '1':
-            stop_event.clear()
             user_input = str(input("Please enter the video file name (file must be in root!): "))
-            total_frames, video_fps, audio_path = preflight_operations(user_input)
+            total_frames, audio_path = preflight_operations(user_input)
             if total_frames:
-                producer = threading.Thread(
-                    target=extract_transform_generate,
-                    args=(user_input, 1, total_frames),
-                    daemon=True,
-                )
-                producer.start()
                 try:
                     if audio_path:
                         play_audio(audio_path)
-                    play_video(fps=video_fps)
-                except KeyboardInterrupt:
-                    stop_event.set()
-                    stop_audio()
-                    try:
-                        frame_queue.put_nowait(None)
-                    except queue.Full:
-                        pass
+                    extract_transform_generate(user_input, 1, total_frames)
+                    play_video(total_frames=total_frames)
                 finally:
                     if audio_path and os.path.exists(audio_path):
                         try:
                             os.remove(audio_path)
                         except OSError:
                             pass
-                producer.join()
         elif user_input == '2':
             exit()
             continue
