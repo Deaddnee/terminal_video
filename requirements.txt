@@ -1,7 +1,6 @@
 opencv-python
 pillow
-playsound
 pygame
 fpstimer
-ffmpeg
 moviepy
+imageio-ffmpeg

@@ -1,15 +1,30 @@
-/.idea
+# IDE and editor settings
+/.idea/
+/.vscode/
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtual environment
+/.venv/
+
+# Generated media and data files
+audio.mp3
+/margerine.mp4
+testvideos/
+/original_scripts/
+
+# Temporary files
+*.log
 *.jpg
 *.txt
-*.log
+
 dev-test.py
 Old stuff/frame-extractor-multithread.py
-audio.mp3
 Old stuff/frame-extractor-multi-process.py
 Old stuff/frame-extractor-pool.py
 Old stuff/frame-extractor.py
 touhou.mp4
-/.venv
-/.vscode
-/margerine.mp4
-testvideos/
